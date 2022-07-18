@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -50,9 +52,7 @@ type User struct {
 type Post struct {
 	ID           int       `db:"id"`
 	UserID       int       `db:"user_id"`
-	Imgdata      []byte    `db:"imgdata"`
 	Body         string    `db:"body"`
-	Mime         string    `db:"mime"`
 	CreatedAt    time.Time `db:"created_at"`
 	CommentCount int
 	Comments     []Comment
@@ -226,16 +226,17 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 }
 
 func imageURL(p Post) string {
-	ext := ""
-	if p.Mime == "image/jpeg" {
-		ext = ".jpg"
-	} else if p.Mime == "image/png" {
-		ext = ".png"
-	} else if p.Mime == "image/gif" {
-		ext = ".gif"
+	pattern := "/home/isucon/static-images/" + strconv.Itoa(p.ID) + ".*"
+	files, err := filepath.Glob(pattern)
+	if err != nil {
+		panic(err)
+	}
+	ext := strings.Split(filepath.Base(files[0]), ".")[1]
+	if ext == "jpg" {
+		ext = "jpeg"
 	}
 
-	return "/image/" + strconv.Itoa(p.ID) + ext
+	return "/image/" + strconv.Itoa(p.ID) + "." + ext
 }
 
 func isLogin(u User) bool {
@@ -265,7 +266,18 @@ func getTemplPath(filename string) string {
 
 func getInitialize(w http.ResponseWriter, r *http.Request) {
 	dbInitialize()
+	imageFolderInitialize()
 	w.WriteHeader(http.StatusOK)
+}
+
+func imageFolderInitialize() {
+	err := os.RemoveAll("/home/isucon/static-images")
+	if err != nil {
+		fmt.Printf("err occured when folder removing: %+v", err)
+	}
+	if err := os.Mkdir("/home/isucon/static-images", 0777); err != nil {
+		fmt.Printf("err occured when folder creating: %+v", err)
+	}
 }
 
 func getLogin(w http.ResponseWriter, r *http.Request) {
@@ -389,7 +401,7 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC")
+	err := db.Select(&results, "SELECT `id`, `user_id`, `body`, `created_at` FROM `posts` ORDER BY `created_at` DESC")
 	if err != nil {
 		log.Print(err)
 		return
@@ -435,7 +447,7 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC", user.ID)
+	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC", user.ID)
 	if err != nil {
 		log.Print(err)
 		return
@@ -616,16 +628,16 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mime := ""
+	ext := ""
 	if file != nil {
 		// 投稿のContent-Typeからファイルのタイプを決定する
 		contentType := header.Header["Content-Type"][0]
 		if strings.Contains(contentType, "jpeg") {
-			mime = "image/jpeg"
+			ext = "jpeg"
 		} else if strings.Contains(contentType, "png") {
-			mime = "image/png"
+			ext = "png"
 		} else if strings.Contains(contentType, "gif") {
-			mime = "image/gif"
+			ext = "gif"
 		} else {
 			session := getSession(r)
 			session.Values["notice"] = "投稿できる画像形式はjpgとpngとgifだけです"
@@ -651,12 +663,10 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	query := "INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (?,?,?,?)"
+	query := "INSERT INTO `posts` (`user_id`, `body`) VALUES (?,?)"
 	result, err := db.Exec(
 		query,
 		me.ID,
-		mime,
-		filedata,
 		r.FormValue("body"),
 	)
 	if err != nil {
@@ -669,40 +679,46 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		log.Print(err)
 		return
 	}
+	postIDStr := strconv.FormatInt(pid, 10)
 
-	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
-}
-
-func getImage(w http.ResponseWriter, r *http.Request) {
-	pidStr := pat.Param(r, "id")
-	pid, err := strconv.Atoi(pidStr)
-	if err != nil {
-		w.WriteHeader(http.StatusNotFound)
-		return
-	}
-
-	post := Post{}
-	err = db.Get(&post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
+	// ファイル保存
+	fileWrite, err := os.Create("/home/isucon/static-images/" + postIDStr + "." + ext)
 	if err != nil {
 		log.Print(err)
 		return
 	}
+	defer fileWrite.Close()
+	_, err = fileWrite.Write(filedata)
 
-	ext := pat.Param(r, "ext")
+	http.Redirect(w, r, "/posts/"+postIDStr, http.StatusFound)
+}
 
-	if ext == "jpg" && post.Mime == "image/jpeg" ||
-		ext == "png" && post.Mime == "image/png" ||
-		ext == "gif" && post.Mime == "image/gif" {
-		w.Header().Set("Content-Type", post.Mime)
-		_, err := w.Write(post.Imgdata)
-		if err != nil {
-			log.Print(err)
-			return
-		}
+func getImage(w http.ResponseWriter, r *http.Request) {
+	pidStr := pat.Param(r, "id")
+
+	pattern := "/home/isucon/static-images/" + pidStr + ".*"
+	files, err := filepath.Glob(pattern)
+	if err != nil {
+		panic(err)
+	}
+	if len(files) == 0 {
+		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
-	w.WriteHeader(http.StatusNotFound)
+	imgData, err := ioutil.ReadFile(files[0])
+	ext := strings.Split(filepath.Base(files[0]), ".")[1]
+	if ext == "jpg" {
+		ext = "jpeg"
+	}
+	mime := "image/" + ext
+
+	w.Header().Set("Content-Type", mime)
+	_, err = w.Write(imgData)
+	if err != nil {
+		log.Print(err)
+		return
+	}
 }
 
 func postComment(w http.ResponseWriter, r *http.Request) {
@@ -820,6 +836,7 @@ func (reg *RegexpPattern) Match(r *http.Request) *http.Request {
 }
 
 func main() {
+	fmt.Printf("started\n")
 	host := os.Getenv("ISUCONP_DB_HOST")
 	if host == "" {
 		host = "localhost"
@@ -869,7 +886,9 @@ func main() {
 	mux.HandleFunc(pat.Get("/posts"), getPosts)
 	mux.HandleFunc(pat.Get("/posts/:id"), getPostsID)
 	mux.HandleFunc(pat.Post("/"), postIndex)
-	mux.HandleFunc(pat.Get("/image/:id.:ext"), getImage)
+
+	// mux.HandleFunc(pat.Get("/image/:id.:ext"), getImage)
+
 	mux.HandleFunc(pat.Post("/comment"), postComment)
 	mux.HandleFunc(pat.Get("/admin/banned"), getAdminBanned)
 	mux.HandleFunc(pat.Post("/admin/banned"), postAdminBanned)
